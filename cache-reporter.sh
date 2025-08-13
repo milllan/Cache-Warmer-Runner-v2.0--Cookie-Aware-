@@ -1,63 +1,77 @@
 #!/bin/bash
-# Cache Warmer Daily Report Generator v1.3 (Adjusted for new stats format)
+# Cache Warmer Daily Report Generator v1.3
 set -euo pipefail
 
 # --- CONFIGURATION ---
+# IMPORTANT: Change this to your actual email address.
 REPORT_EMAIL="your-email@example.com"
 LOG_DIR="/var/log/cache-warmer"
 STATS_FILE="/var/log/cache-warmer/stats.csv"
 # --- END CONFIGURATION ---
 
-if [ ! -d "$LOG_DIR" ]; then echo "Log dir not found" >&2; exit 1; fi
+YESTERDAY=$(date -d "yesterday" --iso-8601=date)
 REPORT_FILE=$(mktemp)
-trap 'rm -f -- "$REPORT_FILE"' EXIT
+trap 'rm -f "$REPORT_FILE"' EXIT
 
-echo "Cache Warmer Daily Report for $(hostname) - $(date)" >> "$REPORT_FILE"
-echo "======================================================" >> "$REPORT_FILE"
+echo "Subject: Cache Warmer Daily Report for ${YESTERDAY}" > "$REPORT_FILE"
+echo "Content-Type: text/plain; charset=UTF-8" >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+echo "=== Cache Warmer Summary for ${YESTERDAY} ===" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
-# FAILED SITES Section (no changes)
-echo "--- FAILED SITES (in last 24 hours) ---" >> "$REPORT_FILE"
-FAILED_LOGS=$(find "$LOG_DIR" -name "*.log" -mtime -1 -exec grep -l -i -E "ERROR|fail|403|404|503|blocked|denied" {} +)
-if [ -n "$FAILED_LOGS" ]; then
-    for logfile in $FAILED_LOGS; do
-        SITENAME=$(basename "$logfile" .log)
-        LAST_ERROR=$(grep -i -E "ERROR|fail|403|404|503|blocked|denied" "$logfile" | tail -n 1)
-        echo "  - $SITENAME: $LAST_ERROR" >> "$REPORT_FILE"
-    done
+# Section 1: Error Summary
+echo "--- Error Summary ---" >> "$REPORT_FILE"
+# Find any file in the log dir modified in the last 24 hours, search for "ERROR"
+ERROR_LOG=$(find "$LOG_DIR" -mtime -1 -type f -name "*.log" -exec grep -H "ERROR" {} +)
+if [[ -n "$ERROR_LOG" ]]; then
+    echo "Errors were detected in the last 24 hours:" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo "$ERROR_LOG" >> "$REPORT_FILE"
 else
-    echo "  No sites failed." >> "$REPORT_FILE"
+    echo "No errors detected in the last 24 hours." >> "$REPORT_FILE"
 fi
 echo "" >> "$REPORT_FILE"
 
-# PERFORMANCE HIGHLIGHTS Section (updated column numbers)
-echo "--- PERFORMANCE HIGHLIGHTS (from last 24 hours) ---" >> "$REPORT_FILE"
-if [ ! -f "$STATS_FILE" ]; then
-    echo "  Stats file not found yet." >> "$REPORT_FILE"
-else
-    RECENT_STATS=$(tail -n +2 "$STATS_FILE" | awk -F, -v d="$(date --date='-24 hours' --iso-8601=seconds)" '$1 > d')
-    if [ -z "$RECENT_STATS" ]; then
-        echo "  No new stats recorded in the last 24 hours." >> "$REPORT_FILE"
-    else
-        echo "  Slowest Average Desktop Times:" >> "$REPORT_FILE"
-        # --- THE FIX IS HERE: Column numbers are updated (e.g., k6 -> k7) ---
-        echo "$RECENT_STATS" | sort -t, -k7 -nr | head -n 5 | awk -F, '{printf "    - %-30s Avg: %s s\n", $2, $7}' >> "$REPORT_FILE"
+# Section 2: Performance Highlights from stats.csv
+echo "--- Performance Highlights (from stats.csv) ---" >> "$REPORT_FILE"
+if [[ -f "$STATS_FILE" ]]; then
+    # Get header and yesterday's data
+    (head -n 1 "$STATS_FILE" && grep "^${YESTERDAY}" "$STATS_FILE") > "${REPORT_FILE}.tmp"
+
+    if [[ $(wc -l < "${REPORT_FILE}.tmp") -gt 1 ]]; then
+        echo "Sites warmed yesterday:" >> "$REPORT_FILE"
         echo "" >> "$REPORT_FILE"
-        echo "  Slowest Average Mobile Times:" >> "$REPORT_FILE"
-        # --- THE FIX IS HERE: Column numbers are updated (e.g., k9 -> k10) ---
-        echo "$RECENT_STATS" | sort -t, -k10 -nr | head -n 5 | awk -F, '{printf "    - %-30s Avg: %s s\n", $2, $10}' >> "$REPORT_FILE"
+        column -t -s, "${REPORT_FILE}.tmp" >> "$REPORT_FILE"
+        
+        # Add summary stats
+        echo "" >> "$REPORT_FILE"
+        echo "---" >> "$REPORT_FILE"
+        # Skip header(NR>1), get stats, then use awk for summary
+        awk -F, 'NR>1 {
+            count++; 
+            urls+=$4; 
+            d_avg_sum+=$7; 
+            m_avg_sum+=$10; 
+            if(min_d=="" || $5<min_d) min_d=$5; 
+            if(max_d=="" || $6>max_d) max_d=$6;
+        } END {
+            if(count>0) {
+                printf "Sites Processed: %d\n", count;
+                printf "Total URLs Warmed: %d\n", urls;
+                printf "Fastest Desktop Page (min): %.4f s\n", min_d;
+                printf "Slowest Desktop Page (max): %.4f s\n", max_d;
+                printf "Overall Desktop Avg: %.4f s\n", d_avg_sum/count;
+                printf "Overall Mobile Avg:  %.4f s\n", m_avg_sum/count;
+            }
+        }' "${REPORT_FILE}.tmp" >> "$REPORT_FILE"
+        
+    else
+        echo "No warming statistics were recorded for ${YESTERDAY}." >> "$REPORT_FILE"
     fi
-fi
-echo "" >> "$REPORT_FILE"
-
-# SUCCESSFUL SITES Section (updated to pull from stats file)
-echo "--- SUCCESSFUL SITES (in last 24 hours) ---" >> "$REPORT_FILE"
-if [ -z "${RECENT_STATS:-}" ]; then
-    echo "  No sites ran successfully in the last 24 hours." >> "$REPORT_FILE"
+    rm -f "${REPORT_FILE}.tmp"
 else
-    # --- THE FIX IS HERE: Now uses the stats file for a cleaner report ---
-    echo "$RECENT_STATS" | awk -F, '{printf "  - %-30s Warmed %s of %s pages\n", $2, $4, $3}' >> "$REPORT_FILE"
+    echo "Statistics file not found at ${STATS_FILE}." >> "$REPORT_FILE"
 fi
 
-mail -s "Cache Warmer Daily Report for $(hostname)" "$REPORT_EMAIL" < "$REPORT_FILE"
-echo "Report sent to $REPORT_EMAIL."
+# Send the email
+/usr/sbin/sendmail -t < "$REPORT_FILE"

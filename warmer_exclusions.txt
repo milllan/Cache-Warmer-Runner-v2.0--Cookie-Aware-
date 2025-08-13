@@ -1,9 +1,11 @@
+# Any URL containing these strings will be excluded from warming.
+# One string per line.
 /my-account
 /checkout
 /cart
 /wishlist
 /wp-admin
-/wp-content/
+/wp-content
 /wp-json
 /wp-includes
 /comments
@@ -16,3 +18,13 @@
 /terms
 /subscription-terms
 /author/
+.jpg
+.jpeg
+.png
+.gif
+.svg
+.pdf
+.xml
+.xsl
+?preview=true
+attachment-sitemap
