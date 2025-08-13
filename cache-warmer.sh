@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cache Warmer Script v5.3 (Replaces all wget with curl for consistency)
+# Cache Warmer Script v5.4 (Final - Corrects curl syntax)
 set -euo pipefail
 
 # --- CONFIGURATION ---
@@ -41,7 +41,6 @@ warm_url() {
     local desktop_time mobile_time
     desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null || echo "0")
     mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null || echo "0")
-    
     local desktop_sleep=0; if is_numeric "$desktop_time"; then desktop_sleep=$(bc <<< "scale=4; if($desktop_time > 0) $desktop_time * $desktop_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
     local mobile_sleep=0; if is_numeric "$mobile_time"; then mobile_sleep=$(bc <<< "scale=4; if($mobile_time > 0) $mobile_time * $mobile_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
     if [[ "$VERBOSE_FLAG" == "verbose" ]]; then
@@ -52,19 +51,14 @@ warm_url() {
     echo "${desktop_time:-0} ${mobile_time:-0}"
 }
 
-calculate_stats() { # This function remains unchanged
-    if [[ $# -eq 0 ]]; then echo "0,0,0"; return; fi
-    local times_array=("$@")
-    local min max; min=$(printf "%s\n" "${times_array[@]}" | sort -n | head -n1); max=$(printf "%s\n" "${times_array[@]}" | sort -n | tail -n1)
-    local total=0; for t in "${times_array[@]}"; do if is_numeric "$t"; then total=$(bc <<< "$total + $t"); fi; done
-    local avg; avg=$(bc <<< "scale=4; $total / ${#times_array[@]}"); echo "$min,$max,$avg"
-}
+calculate_stats() { if [[ $# -eq 0 ]]; then echo "0,0,0"; return; fi; local times_array=("$@"); local min max; min=$(printf "%s\n" "${times_array[@]}" | sort -n | head -n1); max=$(printf "%s\n" "${times_array[@]}" | sort -n | tail -n1); local total=0; for t in "${times_array[@]}"; do if is_numeric "$t"; then total=$(bc <<< "$total + $t"); fi; done; local avg; avg=$(bc <<< "scale=4; $total / ${#times_array[@]}"); echo "$min,$max,$avg"; }
 
 main() {
     if [[ ! -f "$EXCLUSION_FILE" ]]; then log "ERROR: Exclusion file not found"; exit 1; fi
     log "Starting warmer. Fetching index: $SITEMAP_INDEX_URL"
-    # --- MODIFICATION: Replaced wget with curl ---
-    local sitemap_index_content; sitemap_index_content=$(curl --max-time 30 "${resolve_args[@]}" --user-agent="$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>/dev/null || true)
+    
+    # --- MODIFIED LINE: Changed --user-agent to the correct -A syntax ---
+    local sitemap_index_content; sitemap_index_content=$(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>/dev/null || true)
     
     if [[ -z "$sitemap_index_content" ]]; then log "ERROR: Sitemap index is empty or failed to download."; exit 1; fi
     local initial_locs; initial_locs=$(echo "$sitemap_index_content" | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null)
@@ -74,8 +68,7 @@ main() {
         if [[ -z "$url" ]]; then continue; fi
         if [[ "$url" == *.xml* && "$url" != *attachment-sitemap.xml* ]]; then
             log "Processing nested sitemap: $url"
-            # --- MODIFICATION: Replaced wget with curl ---
-            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" --user-agent="$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
+            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then all_page_urls+=("$url"); fi
     done < <(echo "$initial_locs")
