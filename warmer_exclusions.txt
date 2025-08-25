@@ -28,3 +28,5 @@
 .xsl
 ?preview=true
 attachment-sitemap
+/carousel/
+/testimonials/
