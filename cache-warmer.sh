@@ -1,12 +1,16 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.7.1 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.7.2 (portable XML parser, errexit-safe)
 # v5.7: xmlstarlet is now OPTIONAL. It is used when installed; otherwise the
 # sitemap <loc> entries are extracted with a grep/sed fallback. This keeps one
 # identical script runnable on hosts where no packages can be installed
 # (managed shared hosting). Behavior where xmlstarlet exists is unchanged.
 # v5.7.1 (review fixes): errexit-safe curl exit capture in warm_url, || true
-# on the grep branch, &#038;/&#38; entity decoding, whitespace-trim parity
-# between parser modes, and -- before the URL argument.
+# on the grep branch, entity decoding, whitespace-trim parity between parser
+# modes, and -- before the URL argument.
+# v5.7.2 (review round 2): here-string for the HTML sniff (echo|grep under
+# pipefail dies of SIGPIPE on >64KiB bodies), shared entity decode in both
+# parser branches (&amp; last) so hosts warm identical URLs, and a sitemap
+# root-element check that fails loud on junk content.
 set -euo pipefail
 
 # This line finds the directory where the script is located.
@@ -58,23 +62,27 @@ log() {
 }
 
 # Extract one URL per line from sitemap XML on stdin.
-# Both modes trim surrounding whitespace. The modes are equivalent for
-# standard sitemaps (plain <loc> elements, as emitted by WordPress/Yoast) but
-# differ on exotic content: the grep branch does not match CDATA, multiline,
-# or namespace-prefixed <loc>; xmlstarlet handles those. Entities: xmlstarlet
-# decodes numeric entities (&#038; etc.) but re-escapes &amp; on output; the
-# grep branch decodes &amp;, &#38; and &#038; explicitly (WordPress esc_url
-# emits &#038;). The || true in both branches keeps a no-match grep (exit 1)
-# or a failing xmlstarlet from aborting the caller under `set -euo pipefail`.
+# Both modes trim surrounding whitespace and apply the same entity decode
+# (&amp; last, so entity-encoded entities survive one round), so the two
+# hosts warm identical URLs. The modes are equivalent for standard sitemaps
+# (plain <loc> elements, as emitted by WordPress/Yoast) but differ on exotic
+# content: the grep branch does not match CDATA, multiline, or
+# namespace-prefixed <loc>, and matches <loc> inside XML comments; xmlstarlet
+# behaves oppositely on those. The || true in both branches keeps a no-match
+# grep (exit 1) or a failing xmlstarlet from aborting the caller under
+# `set -euo pipefail`.
 parse_locs() {
     if [[ "$PARSE_MODE" == "xmlstarlet" ]]; then
         { xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true; } \
-            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
+                  -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     else
         { grep -o '<loc>[^<]*</loc>' || true; } \
             | sed -e 's|^<loc>||' -e 's|</loc>$||' \
                   -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-                  -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&amp;/\&/g'
+                  -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
+                  -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     fi
 }
 
@@ -216,9 +224,13 @@ main() {
     # Check if we actually got any URLs
     if [[ -z "$initial_locs" ]]; then
          # An HTML page instead of XML usually means an error page, a redirect
-         # into the site, or a bot-block — not a valid sitemap.
-         if echo "$sitemap_index_content" | grep -qi '<html'; then
+         # into the site, or a bot-block — not a valid sitemap. The here-string
+         # (not `echo | grep`) avoids SIGPIPE under pipefail on large bodies.
+         if grep -qi '<html' <<< "$sitemap_index_content"; then
              log "$SAFE_ID" "ERROR: Sitemap URL returned an HTML page, not XML (redirect to site or error page?). Content preview: $(echo "$sitemap_index_content" | head -c 200)"
+             exit 1
+         elif ! grep -q '<urlset\|<sitemapindex' <<< "$sitemap_index_content"; then
+             log "$SAFE_ID" "ERROR: Sitemap content is not a sitemap document (no <urlset>/<sitemapindex> root, no <loc> entries). Content preview: $(echo "$sitemap_index_content" | head -c 200)"
              exit 1
          else
              log "$SAFE_ID" "WARNING: Sitemap parsed successfully but contained no <loc> elements."
