@@ -1,9 +1,12 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.7 (portable XML parser)
+# Cache Warmer Script - PORTABLE v5.7.1 (portable XML parser, errexit-safe)
 # v5.7: xmlstarlet is now OPTIONAL. It is used when installed; otherwise the
 # sitemap <loc> entries are extracted with a grep/sed fallback. This keeps one
 # identical script runnable on hosts where no packages can be installed
 # (managed shared hosting). Behavior where xmlstarlet exists is unchanged.
+# v5.7.1 (review fixes): errexit-safe curl exit capture in warm_url, || true
+# on the grep branch, &#038;/&#38; entity decoding, whitespace-trim parity
+# between parser modes, and -- before the URL argument.
 set -euo pipefail
 
 # This line finds the directory where the script is located.
@@ -55,16 +58,23 @@ log() {
 }
 
 # Extract one URL per line from sitemap XML on stdin.
-# Uses xmlstarlet when available; otherwise a grep/sed fallback that also
-# decodes &amp; -> & (which xmlstarlet's value-of did implicitly).
+# Both modes trim surrounding whitespace. The modes are equivalent for
+# standard sitemaps (plain <loc> elements, as emitted by WordPress/Yoast) but
+# differ on exotic content: the grep branch does not match CDATA, multiline,
+# or namespace-prefixed <loc>; xmlstarlet handles those. Entities: xmlstarlet
+# decodes numeric entities (&#038; etc.) but re-escapes &amp; on output; the
+# grep branch decodes &amp;, &#38; and &#038; explicitly (WordPress esc_url
+# emits &#038;). The || true in both branches keeps a no-match grep (exit 1)
+# or a failing xmlstarlet from aborting the caller under `set -euo pipefail`.
 parse_locs() {
     if [[ "$PARSE_MODE" == "xmlstarlet" ]]; then
-        xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true
+        { xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true; } \
+            | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
     else
-        grep -o '<loc>[^<]*</loc>' \
+        { grep -o '<loc>[^<]*</loc>' || true; } \
             | sed -e 's|^<loc>||' -e 's|</loc>$||' \
                   -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-                  -e 's/&amp;/\&/g'
+                  -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&amp;/\&/g'
     fi
 }
 
@@ -83,8 +93,12 @@ warm_url() {
     local curl_ret=0
 
     # Desktop
-    desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null 2>/dev/null)
-    curl_ret=$?
+    # The `|| curl_ret=$?` shape is required: a bare failing assignment would
+    # trip errexit and abort the whole run before the handling below could
+    # run. `--` guards against a URL that begins with a dash being parsed as
+    # curl options.
+    curl_ret=0
+    desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
     if [[ $curl_ret -eq 28 ]]; then
         log "$safe_id" "WARNING: Timeout warming $url_to_warm (Desktop Agent)"
         desktop_time="0"
@@ -93,8 +107,8 @@ warm_url() {
     fi
 
     # Mobile
-    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null 2>/dev/null)
-    curl_ret=$?
+    curl_ret=0
+    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
     if [[ $curl_ret -eq 28 ]]; then
         log "$safe_id" "WARNING: Timeout warming $url_to_warm (Mobile Agent)"
         mobile_time="0"
@@ -238,7 +252,7 @@ main() {
     local total_warmed_count="${#final_urls[@]}"
     for (( i=0; i<total_warmed_count; i++ )); do
         page_url="${final_urls[i]}"
-        read -r d_time m_time < <(warm_url "$page_url" "$((i+1))" "$total_warmed_count" resolve_args "$SAFE_ID" "$VERBOSE_FLAG")
+        read -r d_time m_time < <(warm_url "$page_url" "$((i+1))" "$total_warmed_count" resolve_args "$SAFE_ID" "$VERBOSE_FLAG") || { d_time=0; m_time=0; }
         desktop_times+=("$d_time")
         mobile_times+=("$m_time")
     done
