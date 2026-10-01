@@ -1,5 +1,9 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.6 (with Dependency Check)
+# Cache Warmer Script - PORTABLE v5.7 (portable XML parser)
+# v5.7: xmlstarlet is now OPTIONAL. It is used when installed; otherwise the
+# sitemap <loc> entries are extracted with a grep/sed fallback. This keeps one
+# identical script runnable on hosts where no packages can be installed
+# (managed shared hosting). Behavior where xmlstarlet exists is unchanged.
 set -euo pipefail
 
 # This line finds the directory where the script is located.
@@ -12,13 +16,15 @@ EXCLUSION_FILE="$SCRIPT_DIR/warmer_exclusions.txt"
 USER_AGENT_DESKTOP="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 USER_AGENT_MOBILE="Mozilla/5.0 (iPhone; CPU iPhone OS 6_1_3 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) CriOS/28.0.1500.12 Mobile/10B329 Safari/8536.25"
 
+# Set by check_dependencies(): "xmlstarlet" or "grep"
+PARSE_MODE=""
+
 # -----------------
 # FUNCTION DEFINITIONS
 # -----------------
 
-# --- NEW: Dependency Check Function ---
 check_dependencies() {
-    local -a required_cmds=("curl" "bc" "xmlstarlet")
+    local -a required_cmds=("curl" "bc" "flock")
     local -a missing_cmds=()
 
     for cmd in "${required_cmds[@]}"; do
@@ -28,12 +34,18 @@ check_dependencies() {
     done
 
     if [ ${#missing_cmds[@]} -gt 0 ]; then
-        echo "ERROR: Missing required command(s): ${missing_cmds[*]}. Please install them." >&2
-        echo "On Debian/Ubuntu, run: sudo apt update && sudo apt install ${missing_cmds[*]}" >&2
+        echo "ERROR: Missing required command(s): ${missing_cmds[*]}." >&2
         exit 1
     fi
+
+    # xmlstarlet is optional: it parses sitemaps more robustly, but hosts
+    # where nothing can be installed fall back to grep/sed (see parse_locs).
+    if command -v xmlstarlet &> /dev/null; then
+        PARSE_MODE="xmlstarlet"
+    else
+        PARSE_MODE="grep"
+    fi
 }
-# --- END NEW ---
 
 # Logs a message to standard error.
 log() {
@@ -42,11 +54,24 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] [$1] $2" >&2
 }
 
-# (The rest of your functions: is_numeric, warm_url, calculate_stats, remain unchanged)
-# ...
+# Extract one URL per line from sitemap XML on stdin.
+# Uses xmlstarlet when available; otherwise a grep/sed fallback that also
+# decodes &amp; -> & (which xmlstarlet's value-of did implicitly).
+parse_locs() {
+    if [[ "$PARSE_MODE" == "xmlstarlet" ]]; then
+        xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true
+    else
+        grep -o '<loc>[^<]*</loc>' \
+            | sed -e 's|^<loc>||' -e 's|</loc>$||' \
+                  -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  -e 's/&amp;/\&/g'
+    fi
+}
+
 is_numeric() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
+
 warm_url() {
     local url_to_warm="$1"
     local progress_counter="$2"
@@ -57,7 +82,6 @@ warm_url() {
     local desktop_time mobile_time
     local curl_ret=0
 
-    # We use a subshell or capture exit code for individual requests
     # Desktop
     desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null 2>/dev/null)
     curl_ret=$?
@@ -89,6 +113,7 @@ warm_url() {
     sleep "${mobile_sleep:-0}"
     echo "${desktop_time:-0} ${mobile_time:-0}"
 }
+
 calculate_stats() {
     if [[ $# -eq 0 ]]; then echo "0,0,0"; return; fi
     local times_array=("$@")
@@ -103,17 +128,17 @@ calculate_stats() {
     avg=$(bc <<< "scale=4; $total / ${#times_array[@]}")
     echo "$min,$max,$avg"
 }
-# ...
 
 # -----------------
 # MAIN SCRIPT LOGIC
 # -----------------
+
 main() {
     local URL_DOMAIN=$1
     local SITEMAP_PATH=$2
     local VERBOSE_FLAG="${3:-}"
     local ORIGIN_IP="${4:-}"
-    
+
     local SITEMAP_INDEX_URL="https://$URL_DOMAIN/$SITEMAP_PATH"
 
     # Ensure local directories exist
@@ -128,8 +153,6 @@ main() {
     fi
     trap 'flock -u 200; rm -f "$LOCK_FILE"' EXIT
 
-    # (The rest of your main function remains unchanged)
-    # ...
     if [[ ! -f "$EXCLUSION_FILE" ]]; then
         log "$SAFE_ID" "ERROR: Exclusion file not found at $EXCLUSION_FILE"
         exit 1
@@ -140,16 +163,16 @@ main() {
         resolve_args=("--resolve" "${base_domain}:443:${ORIGIN_IP}")
         log "$SAFE_ID" "Using Origin IP ${ORIGIN_IP} to bypass proxy/CDN."
     fi
-    log "$SAFE_ID" "Starting warmer. Fetching index: $SITEMAP_INDEX_URL"
+    log "$SAFE_ID" "Starting warmer (parser: $PARSE_MODE). Fetching index: $SITEMAP_INDEX_URL"
     local sitemap_index_content
     local curl_exit_code=0
-    
+
     # Capture output and exit code carefully.
     # We use temporary set +e because we want to handle the failure manually.
     set +e
     # Strip leading whitespace/BOM before the XML declaration — some WP plugins
-    # echo a blank line into sitemap renders, which makes xmlstarlet reject the
-    # whole document. (incident 2026-09-06, sculpiflex.com)
+    # echo a blank line into sitemap renders, which breaks XML parsing.
+    # (incident 2026-09-06, sculpiflex.com)
     sitemap_index_content=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>&1 | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' | sed -e 's/^[[:space:]]*//' )
     curl_exit_code=$?
     set -e
@@ -169,21 +192,19 @@ main() {
         exit 1
     fi
 
-    # If curl succeeded (HTTP 200), proceed with processing
-    
     if [[ "$VERBOSE_FLAG" == "verbose" ]]; then
         log "$SAFE_ID" "DEBUG: Downloaded sitemap content length: ${#sitemap_index_content} chars"
     fi
-    
+
     local initial_locs
-    # Added || true to prevent set -e/pipefail from killing the script if xmlstarlet fails
-    initial_locs=$(echo "$sitemap_index_content" | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
-    
+    initial_locs=$(echo "$sitemap_index_content" | parse_locs)
+
     # Check if we actually got any URLs
     if [[ -z "$initial_locs" ]]; then
-         # Try to see if it was a parsing error or just empty
-         if ! echo "$sitemap_index_content" | xmlstarlet val - 2>/dev/null >/dev/null; then
-             log "$SAFE_ID" "ERROR: Failed to parse sitemap (Invalid XML). Content preview: $(echo "$sitemap_index_content" | head -n 3)"
+         # An HTML page instead of XML usually means an error page, a redirect
+         # into the site, or a bot-block — not a valid sitemap.
+         if echo "$sitemap_index_content" | grep -qi '<html'; then
+             log "$SAFE_ID" "ERROR: Sitemap URL returned an HTML page, not XML (redirect to site or error page?). Content preview: $(echo "$sitemap_index_content" | head -c 200)"
              exit 1
          else
              log "$SAFE_ID" "WARNING: Sitemap parsed successfully but contained no <loc> elements."
@@ -194,7 +215,7 @@ main() {
         if [[ -z "$url" ]]; then continue; fi
         if [[ "$url" == *.xml* && "$url" != *attachment-sitemap.xml* ]]; then
             log "$SAFE_ID" "Processing nested sitemap: $url"
-            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
+            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
@@ -232,12 +253,10 @@ main() {
     fi
     echo "$timestamp,$SAFE_ID,$total_unique_count,${#final_urls[@]},$desktop_stats,$mobile_stats" >> "$STATS_FILE"
     log "$SAFE_ID" "Warming complete. Stats saved to $STATS_FILE"
-    # ...
 }
 
 # --- SCRIPT EXECUTION STARTS HERE ---
 
-# --- NEW: Call the dependency check function first ---
 check_dependencies
 
 # Check for arguments before defining variables that depend on them
