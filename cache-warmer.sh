@@ -55,8 +55,29 @@ warm_url() {
     local safe_id="$5"
     local verbose_flag="$6"
     local desktop_time mobile_time
-    desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null || echo "0")
-    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null || echo "0")
+    local curl_ret=0
+
+    # We use a subshell or capture exit code for individual requests
+    # Desktop
+    desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null 2>/dev/null)
+    curl_ret=$?
+    if [[ $curl_ret -eq 28 ]]; then
+        log "$safe_id" "WARNING: Timeout warming $url_to_warm (Desktop Agent)"
+        desktop_time="0"
+    elif [[ $curl_ret -ne 0 ]]; then
+        desktop_time="0"
+    fi
+
+    # Mobile
+    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -w "%{time_total}" "$url_to_warm" -o /dev/null 2>/dev/null)
+    curl_ret=$?
+    if [[ $curl_ret -eq 28 ]]; then
+        log "$safe_id" "WARNING: Timeout warming $url_to_warm (Mobile Agent)"
+        mobile_time="0"
+    elif [[ $curl_ret -ne 0 ]]; then
+        mobile_time="0"
+    fi
+
     local desktop_sleep=0; if is_numeric "$desktop_time"; then desktop_sleep=$(bc <<< "scale=4; if($desktop_time > 0) $desktop_time * $desktop_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
     local mobile_sleep=0; if is_numeric "$mobile_time"; then mobile_sleep=$(bc <<< "scale=4; if($mobile_time > 0) $mobile_time * $mobile_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
     if [[ "$verbose_flag" == "verbose" ]]; then
@@ -121,23 +142,59 @@ main() {
     fi
     log "$SAFE_ID" "Starting warmer. Fetching index: $SITEMAP_INDEX_URL"
     local sitemap_index_content
-    sitemap_index_content=$(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>/dev/null || true)
-    if [[ -z "$sitemap_index_content" ]]; then
-        log "$SAFE_ID" "ERROR: Sitemap index is empty or failed to download."
+    local curl_exit_code=0
+    
+    # Capture output and exit code carefully.
+    # We use temporary set +e because we want to handle the failure manually.
+    set +e
+    # Strip leading whitespace/BOM before the XML declaration — some WP plugins
+    # echo a blank line into sitemap renders, which makes xmlstarlet reject the
+    # whole document. (incident 2026-09-06, sculpiflex.com)
+    sitemap_index_content=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>&1 | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' | sed -e 's/^[[:space:]]*//' )
+    curl_exit_code=$?
+    set -e
+
+    if [[ $curl_exit_code -ne 0 ]]; then
+        if [[ $curl_exit_code -eq 28 ]]; then
+             log "$SAFE_ID" "CRITICAL ERROR: Connection timed out fetching sitemap (Exit Code 28). Possible Firewall/IP Block."
+        elif [[ $curl_exit_code -eq 7 ]]; then
+             log "$SAFE_ID" "CRITICAL ERROR: Connection refused (Exit Code 7). Server might be down or not listening on this port."
+        elif [[ $curl_exit_code -eq 22 ]]; then
+             log "$SAFE_ID" "CRITICAL ERROR: HTTP Error (Exit Code 22). The server returned a 4xx or 5xx status."
+        elif [[ $curl_exit_code -eq 6 ]]; then
+             log "$SAFE_ID" "CRITICAL ERROR: Could not resolve host (Exit Code 6). Check DNS or typos."
+        else
+             log "$SAFE_ID" "CRITICAL ERROR: Failed to download sitemap. Curl Exit Code: $curl_exit_code. Error details: $sitemap_index_content"
+        fi
         exit 1
     fi
+
+    # If curl succeeded (HTTP 200), proceed with processing
+    
+    if [[ "$VERBOSE_FLAG" == "verbose" ]]; then
+        log "$SAFE_ID" "DEBUG: Downloaded sitemap content length: ${#sitemap_index_content} chars"
+    fi
+    
     local initial_locs
-    initial_locs=$(echo "$sitemap_index_content" | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        log "$SAFE_ID" "ERROR: Failed to parse sitemap (likely HTML block from server)."
-        exit 1
+    # Added || true to prevent set -e/pipefail from killing the script if xmlstarlet fails
+    initial_locs=$(echo "$sitemap_index_content" | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
+    
+    # Check if we actually got any URLs
+    if [[ -z "$initial_locs" ]]; then
+         # Try to see if it was a parsing error or just empty
+         if ! echo "$sitemap_index_content" | xmlstarlet val - 2>/dev/null >/dev/null; then
+             log "$SAFE_ID" "ERROR: Failed to parse sitemap (Invalid XML). Content preview: $(echo "$sitemap_index_content" | head -n 3)"
+             exit 1
+         else
+             log "$SAFE_ID" "WARNING: Sitemap parsed successfully but contained no <loc> elements."
+         fi
     fi
     declare -a all_page_urls=()
     while read -r url; do
         if [[ -z "$url" ]]; then continue; fi
         if [[ "$url" == *.xml* && "$url" != *attachment-sitemap.xml* ]]; then
             log "$SAFE_ID" "Processing nested sitemap: $url"
-            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
+            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | xmlstarlet sel -t -v "//_:loc" -n 2>/dev/null || true)
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
