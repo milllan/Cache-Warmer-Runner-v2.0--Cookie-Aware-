@@ -3,10 +3,10 @@
 set -euo pipefail
 
 # --- CONFIGURATION ---
-WARMER_SCRIPT="/root/cache-warmer.sh"
-SITES_CONFIG="/root/sites.conf"
-LOG_DIR="/var/log/cache-warmer"
-LOCK_DIR="/var/run/cache-warmer"
+WARMER_SCRIPT="/opt/cache-warmer/cache-warmer.sh"
+SITES_CONFIG="/opt/cache-warmer/sites.conf"
+LOG_DIR="./logs"
+LOCK_DIR="./run"
 MAX_JOBS=9
 # --- END CONFIGURATION ---
 
