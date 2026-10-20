@@ -1,10 +1,12 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.8.3 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.8.4 (portable XML parser, errexit-safe)
 # v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
 # answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
 # target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
 # dozen archives, so one blog archive was fetched 53x per run. Redirect count is
 # logged per run. Sitemap fetches still follow redirects.
+# v5.8.4: a child sitemap answering 200 with a non-sitemap body (HTML bot-block,
+# error page) counts as failed too, same test as the index.
 # v5.8.3: no URLs because child sitemaps failed exits 3, not 1 (no re-arm loop).
 # v5.8.2: a run that could not read part of the sitemap now exits non-zero (1: no
 # URLs at all; 3: some child sitemaps failed, the rest was warmed), so callers
@@ -270,6 +272,12 @@ main() {
             # Assignment (not process substitution) so a failed fetch is visible.
             if ! nested_xml=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null); then
                 log "$SAFE_ID" "WARNING: could not fetch nested sitemap $url"
+                nested_failed=$((nested_failed + 1))
+                continue
+            fi
+            # Same junk test as the index: a 200 that is not a sitemap document.
+            if ! grep -q '<urlset\|<sitemapindex' <<< "$nested_xml"; then
+                log "$SAFE_ID" "WARNING: nested sitemap $url is not a sitemap document: $(head -c 120 <<< "$nested_xml")"
                 nested_failed=$((nested_failed + 1))
                 continue
             fi
