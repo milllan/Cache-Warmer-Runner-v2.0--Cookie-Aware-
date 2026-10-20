@@ -1,10 +1,18 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.8.0 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.8.3 (portable XML parser, errexit-safe)
 # v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
 # answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
 # target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
 # dozen archives, so one blog archive was fetched 53x per run. Redirect count is
 # logged per run. Sitemap fetches still follow redirects.
+# v5.8.3: no URLs because child sitemaps failed exits 3, not 1 (no re-arm loop).
+# v5.8.2: a run that could not read part of the sitemap now exits non-zero (1: no
+# URLs at all; 3: some child sitemaps failed, the rest was warmed), so callers
+# such as warm-on-flag.sh can retry. Child sitemap fetches use --fail.
+# v5.8.1: optional per-site extra URLs (extra-urls/<domain>.txt, one absolute URL
+# per line, # comments) for pages no sitemap lists, e.g. rewrite-served listings
+# that v5.8.0 no longer reaches through redirects. CACHE_WARMER_BUSY_EXIT sets the
+# exit code when another run holds the lock (default 0, unchanged).
 # v5.7: xmlstarlet is now OPTIONAL. It is used when installed; otherwise the
 # sitemap <loc> entries are extracted with a grep/sed fallback. This keeps one
 # identical script runnable on hosts where no packages can be installed
@@ -25,6 +33,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 STATS_FILE="$SCRIPT_DIR/logs/stats.csv"
 LOCK_DIR="$SCRIPT_DIR/run"
 EXCLUSION_FILE="$SCRIPT_DIR/warmer_exclusions.txt"
+EXTRA_URLS_DIR="$SCRIPT_DIR/extra-urls"
 USER_AGENT_DESKTOP="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 USER_AGENT_MOBILE="Mozilla/5.0 (iPhone; CPU iPhone OS 6_1_3 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) CriOS/28.0.1500.12 Mobile/10B329 Safari/8536.25"
 
@@ -187,7 +196,7 @@ main() {
     exec 200>"$LOCK_FILE"
     if ! flock -n 200; then
         log "$SAFE_ID" "Could not acquire lock, another process is running. Exiting."
-        exit 0
+        exit "${CACHE_WARMER_BUSY_EXIT:-0}"
     fi
     trap 'flock -u 200; rm -f "$LOCK_FILE"' EXIT
 
@@ -253,26 +262,42 @@ main() {
          fi
     fi
     declare -a all_page_urls=()
+    local nested_failed=0 nested_xml
     while read -r url; do
         if [[ -z "$url" ]]; then continue; fi
         if [[ "$url" == *.xml* && "$url" != *attachment-sitemap.xml* ]]; then
             log "$SAFE_ID" "Processing nested sitemap: $url"
-            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
+            # Assignment (not process substitution) so a failed fetch is visible.
+            if ! nested_xml=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null); then
+                log "$SAFE_ID" "WARNING: could not fetch nested sitemap $url"
+                nested_failed=$((nested_failed + 1))
+                continue
+            fi
+            mapfile -t nested_urls < <(printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
         fi
     done < <(echo "$initial_locs")
+    local extra_file="$EXTRA_URLS_DIR/$SAFE_ID.txt"
+    if [[ -f "$extra_file" ]]; then
+        mapfile -t extra_urls < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -- "$extra_file" | grep . || true)
+        log "$SAFE_ID" "Adding ${#extra_urls[@]} extra URLs from $extra_file"
+        all_page_urls+=("${extra_urls[@]}")
+    fi
     if [[ ${#all_page_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No page URLs found after processing. Exiting."
-        exit 0
+        # 3 when child sitemaps failed: warm-on-flag must not re-arm a permanently
+        # broken sitemap every tick. 1 (re-armed) only for an empty sitemap.
+        (( nested_failed > 0 )) && exit 3
+        exit 1
     fi
     mapfile -t unique_urls < <(printf "%s\n" "${all_page_urls[@]}" | grep . | sort -u)
     local total_unique_count=${#unique_urls[@]}
     mapfile -t final_urls < <(printf "%s\n" "${unique_urls[@]}" | grep -vFf "$EXCLUSION_FILE")
     if [[ ${#final_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No valid URLs left after filtering. Exiting."
-        exit 0
+        exit 1
     fi
     log "$SAFE_ID" "Found $total_unique_count total unique pages. Warming ${#final_urls[@]} after filtering..."
     declare -a desktop_times=()
@@ -302,6 +327,10 @@ main() {
     # columns keep their meaning for cache-reporter.sh.
     echo "$timestamp,$SAFE_ID,$total_unique_count,$(( ${#final_urls[@]} - redirect_count )),$desktop_stats,$mobile_stats" >> "$STATS_FILE"
     log "$SAFE_ID" "Warming complete ($redirect_count redirecting sitemap URLs skipped). Stats saved to $STATS_FILE"
+    if (( nested_failed > 0 )); then
+        log "$SAFE_ID" "Partial warm: $nested_failed nested sitemap(s) could not be fetched."
+        exit 3
+    fi
 }
 
 # --- SCRIPT EXECUTION STARTS HERE ---

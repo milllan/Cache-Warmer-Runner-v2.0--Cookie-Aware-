@@ -34,8 +34,11 @@ grep -vE '^\s*(#|$)' "$SITES_CONFIG" | shuf | while IFS= read -r line; do
     
     if [[ -z "$domain" || -z "$sitemap" ]]; then continue; fi
     
+    # A site's warm may exit non-zero (cache-warmer: 1 nothing warmed, 3 partial,
+    # 75 busy). Under set -e a bare wait -n would abort the dispatch loop and leave
+    # every remaining site unwarmed; log it and carry on.
     while (( $(jobs -r -p | wc -l) >= MAX_JOBS )); do
-        wait -n
+        wait -n || log "A warm job exited with status $?"
     done
 
     random_delay=$(awk -v min=3 -v max=7 'BEGIN{srand(); print min+rand()*(max-min)}')
@@ -48,5 +51,5 @@ grep -vE '^\s*(#|$)' "$SITES_CONFIG" | shuf | while IFS= read -r line; do
     ) 2>&1 | tee "${LOG_DIR}/${domain//\//-}.log" & # Sanitize log filename
 
 done
-wait
+wait || true
 log "All warming tasks dispatched and completed."
