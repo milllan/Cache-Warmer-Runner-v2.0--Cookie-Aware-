@@ -1,0 +1,8 @@
+logs/
+run/
+*.bak-*
+
+# Private, not published (client domains / origin IPs)
+sites.conf
+es-cache-warmer.sh
+recovered-crontab.txt
