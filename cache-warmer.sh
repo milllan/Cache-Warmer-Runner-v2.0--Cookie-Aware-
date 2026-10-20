@@ -1,10 +1,13 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.8.1 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.8.2 (portable XML parser, errexit-safe)
 # v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
 # answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
 # target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
 # dozen archives, so one blog archive was fetched 53x per run. Redirect count is
 # logged per run. Sitemap fetches still follow redirects.
+# v5.8.2: a run that could not read part of the sitemap now exits non-zero (1: no
+# URLs at all; 3: some child sitemaps failed, the rest was warmed), so callers
+# such as warm-on-flag.sh can retry. Child sitemap fetches use --fail.
 # v5.8.1: optional per-site extra URLs (extra-urls/<domain>.txt, one absolute URL
 # per line, # comments) for pages no sitemap lists, e.g. rewrite-served listings
 # that v5.8.0 no longer reaches through redirects. CACHE_WARMER_BUSY_EXIT sets the
@@ -258,11 +261,18 @@ main() {
          fi
     fi
     declare -a all_page_urls=()
+    local nested_failed=0 nested_xml
     while read -r url; do
         if [[ -z "$url" ]]; then continue; fi
         if [[ "$url" == *.xml* && "$url" != *attachment-sitemap.xml* ]]; then
             log "$SAFE_ID" "Processing nested sitemap: $url"
-            mapfile -t nested_urls < <(curl --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
+            # Assignment (not process substitution) so a failed fetch is visible.
+            if ! nested_xml=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$url" 2>/dev/null); then
+                log "$SAFE_ID" "WARNING: could not fetch nested sitemap $url"
+                nested_failed=$((nested_failed + 1))
+                continue
+            fi
+            mapfile -t nested_urls < <(printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
@@ -276,14 +286,14 @@ main() {
     fi
     if [[ ${#all_page_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No page URLs found after processing. Exiting."
-        exit 0
+        exit 1
     fi
     mapfile -t unique_urls < <(printf "%s\n" "${all_page_urls[@]}" | grep . | sort -u)
     local total_unique_count=${#unique_urls[@]}
     mapfile -t final_urls < <(printf "%s\n" "${unique_urls[@]}" | grep -vFf "$EXCLUSION_FILE")
     if [[ ${#final_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No valid URLs left after filtering. Exiting."
-        exit 0
+        exit 1
     fi
     log "$SAFE_ID" "Found $total_unique_count total unique pages. Warming ${#final_urls[@]} after filtering..."
     declare -a desktop_times=()
@@ -313,6 +323,10 @@ main() {
     # columns keep their meaning for cache-reporter.sh.
     echo "$timestamp,$SAFE_ID,$total_unique_count,$(( ${#final_urls[@]} - redirect_count )),$desktop_stats,$mobile_stats" >> "$STATS_FILE"
     log "$SAFE_ID" "Warming complete ($redirect_count redirecting sitemap URLs skipped). Stats saved to $STATS_FILE"
+    if (( nested_failed > 0 )); then
+        log "$SAFE_ID" "Partial warm: $nested_failed nested sitemap(s) could not be fetched."
+        exit 3
+    fi
 }
 
 # --- SCRIPT EXECUTION STARTS HERE ---
