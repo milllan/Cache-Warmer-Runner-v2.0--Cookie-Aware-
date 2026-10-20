@@ -1,10 +1,11 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.8.2 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.8.3 (portable XML parser, errexit-safe)
 # v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
 # answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
 # target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
 # dozen archives, so one blog archive was fetched 53x per run. Redirect count is
 # logged per run. Sitemap fetches still follow redirects.
+# v5.8.3: no URLs because child sitemaps failed exits 3, not 1 (no re-arm loop).
 # v5.8.2: a run that could not read part of the sitemap now exits non-zero (1: no
 # URLs at all; 3: some child sitemaps failed, the rest was warmed), so callers
 # such as warm-on-flag.sh can retry. Child sitemap fetches use --fail.
@@ -286,6 +287,9 @@ main() {
     fi
     if [[ ${#all_page_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No page URLs found after processing. Exiting."
+        # 3 when child sitemaps failed: warm-on-flag must not re-arm a permanently
+        # broken sitemap every tick. 1 (re-armed) only for an empty sitemap.
+        (( nested_failed > 0 )) && exit 3
         exit 1
     fi
     mapfile -t unique_urls < <(printf "%s\n" "${all_page_urls[@]}" | grep . | sort -u)
