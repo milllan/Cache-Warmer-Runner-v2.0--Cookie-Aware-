@@ -1,5 +1,10 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.7.2 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.8.0 (portable XML parser, errexit-safe)
+# v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
+# answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
+# target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
+# dozen archives, so one blog archive was fetched 53x per run. Redirect count is
+# logged per run. Sitemap fetches still follow redirects.
 # v5.7: xmlstarlet is now OPTIONAL. It is used when installed; otherwise the
 # sitemap <loc> entries are extracted with a grep/sed fallback. This keeps one
 # identical script runnable on hosts where no packages can be installed
@@ -106,7 +111,18 @@ warm_url() {
     # run. `--` guards against a URL that begins with a dash being parsed as
     # curl options.
     curl_ret=0
-    desktop_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
+    local desktop_out="" desktop_code=""
+    desktop_out=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_DESKTOP" -s --compressed -o /dev/null -w "%{time_total} %{http_code}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
+    read -r desktop_time desktop_code <<< "$desktop_out" || true
+    # A redirecting sitemap entry warms nothing useful: its target is (or will
+    # be) warmed as its own sitemap entry. Skip the mobile fetch and back-off.
+    if [[ $curl_ret -eq 0 && "$desktop_code" =~ ^3[0-9][0-9]$ ]]; then
+        if [[ "$verbose_flag" == "verbose" ]]; then
+            printf "[%s] %-12s / %-30s / %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "($progress_counter/$total_urls)" "SKIP redirect $desktop_code" "$url_to_warm" >&2
+        fi
+        echo "redirect redirect"
+        return 0
+    fi
     if [[ $curl_ret -eq 28 ]]; then
         log "$safe_id" "WARNING: Timeout warming $url_to_warm (Desktop Agent)"
         desktop_time="0"
@@ -116,7 +132,7 @@ warm_url() {
 
     # Mobile
     curl_ret=0
-    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -sL --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
+    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -s --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
     if [[ $curl_ret -eq 28 ]]; then
         log "$safe_id" "WARNING: Timeout warming $url_to_warm (Mobile Agent)"
         mobile_time="0"
@@ -194,7 +210,7 @@ main() {
     set +e
     # Strip leading whitespace/BOM before the XML declaration — some WP plugins
     # echo a blank line into sitemap renders, which breaks XML parsing.
-    # (incident 2026-09-06, sculpiflex.com)
+    # (incident 2026-09-06)
     sitemap_index_content=$(curl --fail --max-time 30 "${resolve_args[@]}" -A "$USER_AGENT_DESKTOP" -sL --compressed "$SITEMAP_INDEX_URL" 2>&1 | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' | sed -e 's/^[[:space:]]*//' )
     curl_exit_code=$?
     set -e
@@ -261,10 +277,15 @@ main() {
     log "$SAFE_ID" "Found $total_unique_count total unique pages. Warming ${#final_urls[@]} after filtering..."
     declare -a desktop_times=()
     declare -a mobile_times=()
+    local redirect_count=0
     local total_warmed_count="${#final_urls[@]}"
     for (( i=0; i<total_warmed_count; i++ )); do
         page_url="${final_urls[i]}"
         read -r d_time m_time < <(warm_url "$page_url" "$((i+1))" "$total_warmed_count" resolve_args "$SAFE_ID" "$VERBOSE_FLAG") || { d_time=0; m_time=0; }
+        if [[ "$d_time" == "redirect" ]]; then
+            redirect_count=$((redirect_count + 1))
+            continue
+        fi
         desktop_times+=("$d_time")
         mobile_times+=("$m_time")
     done
@@ -277,8 +298,10 @@ main() {
     if [ ! -f "$STATS_FILE" ]; then
         echo "timestamp,domain,total_unique_urls,urls_warmed,desktop_min_s,desktop_max_s,desktop_avg_s,mobile_min_s,mobile_max_s,mobile_avg_s" > "$STATS_FILE"
     fi
-    echo "$timestamp,$SAFE_ID,$total_unique_count,${#final_urls[@]},$desktop_stats,$mobile_stats" >> "$STATS_FILE"
-    log "$SAFE_ID" "Warming complete. Stats saved to $STATS_FILE"
+    # urls_warmed counts pages actually warmed (redirects excluded), so the CSV
+    # columns keep their meaning for cache-reporter.sh.
+    echo "$timestamp,$SAFE_ID,$total_unique_count,$(( ${#final_urls[@]} - redirect_count )),$desktop_stats,$mobile_stats" >> "$STATS_FILE"
+    log "$SAFE_ID" "Warming complete ($redirect_count redirecting sitemap URLs skipped). Stats saved to $STATS_FILE"
 }
 
 # --- SCRIPT EXECUTION STARTS HERE ---
