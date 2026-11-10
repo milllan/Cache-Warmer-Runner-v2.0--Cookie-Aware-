@@ -51,7 +51,7 @@ if [[ -f "$STATS_FILE" ]]; then
             count++; 
             urls+=$4; 
             d_avg_sum+=$7; 
-            m_avg_sum+=$10; 
+            if($10!="") { m_avg_sum+=$10; m_count++ }  # empty in single-UA runs
             if(min_d=="" || $5<min_d) min_d=$5; 
             if(max_d=="" || $6>max_d) max_d=$6;
         } END {
@@ -61,7 +61,8 @@ if [[ -f "$STATS_FILE" ]]; then
                 printf "Fastest Desktop Page (min): %.4f s\n", min_d;
                 printf "Slowest Desktop Page (max): %.4f s\n", max_d;
                 printf "Overall Desktop Avg: %.4f s\n", d_avg_sum/count;
-                printf "Overall Mobile Avg:  %.4f s\n", m_avg_sum/count;
+                if(m_count>0) printf "Overall Mobile Avg:  %.4f s\n", m_avg_sum/m_count;
+                else printf "Overall Mobile Avg:  n/a (single-UA runs only)\n";
             }
         }' "${REPORT_FILE}.tmp" >> "$REPORT_FILE"
         

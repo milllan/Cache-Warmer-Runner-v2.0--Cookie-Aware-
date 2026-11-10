@@ -2,7 +2,8 @@
 # Cache Warmer Script - PORTABLE v5.9.0 (portable XML parser, errexit-safe)
 # v5.9.0: no bc and no /dev/fd (process substitution) dependency (pause and stats math in awk, present everywhere), so
 # the script runs on managed hosts without bc. The grep parser now reads
-# <loc><![CDATA[...]]></loc> entries (some SEO plugins emit them).
+# <loc><![CDATA[...]]></loc> entries (some SEO plugins emit them), CDATA text
+# taken literally as xmlstarlet does. Averages round to 4 decimals (bc truncated).
 # CACHE_WARMER_SINGLE_UA=1 (exactly "1") fetches each URL once (desktop UA only)
 # for hosts whose page cache shares one entry between mobile and desktop; the
 # mobile stats columns are then left empty.
@@ -104,9 +105,13 @@ parse_locs() {
                   -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     else
+        # CDATA content is literal XML text: passed through as-is (no entity
+        # decode), which is what xmlstarlet yields after its own escaping round.
         { grep -oE '<loc>[[:space:]]*(<!\[CDATA\[)?[^<]*(]]>)?[[:space:]]*</loc>' || true; } \
-            | sed -e 's|^<loc>||' -e 's|</loc>$||' -e 's|^[[:space:]]*<!\[CDATA\[||' -e 's|]]>[[:space:]]*$||' \
+            | sed -e 's|^<loc>||' -e 's|</loc>$||' \
                   -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  -e '/^<!\[CDATA\[/{' -e 's|^<!\[CDATA\[||' -e 's|]]>$||' \
+                  -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 'b' -e '}' \
                   -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     fi
@@ -296,7 +301,9 @@ main() {
                 nested_failed=$((nested_failed + 1))
                 continue
             fi
-            printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs | mapfile -t nested_urls
+            # Guarded like the old process substitution: a parser that stops early
+            # (SIGPIPE upstream) must not abort the run under pipefail.
+            { printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs || true; } | mapfile -t nested_urls
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
