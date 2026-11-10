@@ -91,8 +91,8 @@ log() {
 # (&amp; last, so entity-encoded entities survive one round), so the two
 # hosts warm identical URLs. The modes are equivalent for standard sitemaps
 # (plain <loc> elements, as emitted by WordPress/Yoast) but differ on exotic
-# content: the grep branch reads <loc><![CDATA[...]]></loc> (no whitespace
-# between <loc> and the CDATA) but not multiline or
+# content: the grep branch reads single-line <loc><![CDATA[...]]></loc> (spaces
+# around the CDATA allowed) but not multiline or
 # namespace-prefixed <loc>, and matches <loc> inside XML comments; xmlstarlet
 # behaves oppositely on those. The || true in both branches keeps a no-match
 # grep (exit 1) or a failing xmlstarlet from aborting the caller under
@@ -104,8 +104,8 @@ parse_locs() {
                   -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     else
-        { grep -oE '<loc>(<!\[CDATA\[)?[^<]*(]]>)?</loc>' || true; } \
-            | sed -e 's|^<loc>||' -e 's|</loc>$||' -e 's|^<!\[CDATA\[||' -e 's|]]>$||' \
+        { grep -oE '<loc>[[:space:]]*(<!\[CDATA\[)?[^<]*(]]>)?[[:space:]]*</loc>' || true; } \
+            | sed -e 's|^<loc>||' -e 's|</loc>$||' -e 's|^[[:space:]]*<!\[CDATA\[||' -e 's|]]>[[:space:]]*$||' \
                   -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
                   -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
