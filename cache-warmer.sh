@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cache Warmer Script - PORTABLE v5.9.0 (portable XML parser, errexit-safe)
-# v5.9.0: no bc dependency (pause and stats math in awk, present everywhere), so
+# v5.9.0: no bc and no /dev/fd (process substitution) dependency (pause and stats math in awk, present everywhere), so
 # the script runs on managed hosts without bc. The grep parser now reads
 # <loc><![CDATA[...]]></loc> entries (some SEO plugins emit them).
 # CACHE_WARMER_SINGLE_UA=1 (exactly "1") fetches each URL once (desktop UA only)
@@ -33,6 +33,9 @@
 # parser branches (&amp; last) so hosts warm identical URLs, and a sitemap
 # root-element check that fails loud on junk content.
 set -euo pipefail
+# No process substitution (< <(...)): some managed hosts have no /dev/fd. Pipes
+# into mapfile/read run in this shell via lastpipe instead (non-interactive only).
+shopt -s lastpipe
 
 # This line finds the directory where the script is located.
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
@@ -293,15 +296,15 @@ main() {
                 nested_failed=$((nested_failed + 1))
                 continue
             fi
-            mapfile -t nested_urls < <(printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs)
+            printf '%s\n' "$nested_xml" | sed -e 's/\xef\xbb\xbf//' -e '/./,$!d' -e 's/^[[:space:]]*//' | parse_locs | mapfile -t nested_urls
             all_page_urls+=("${nested_urls[@]}")
         elif [[ "$url" != *.xml* ]]; then
             all_page_urls+=("$url")
         fi
-    done < <(echo "$initial_locs")
+    done <<< "$initial_locs"
     local extra_file="$EXTRA_URLS_DIR/$SAFE_ID.txt"
     if [[ -f "$extra_file" ]]; then
-        mapfile -t extra_urls < <(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -- "$extra_file" | grep . || true)
+        { sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -- "$extra_file" | grep . || true; } | mapfile -t extra_urls
         log "$SAFE_ID" "Adding ${#extra_urls[@]} extra URLs from $extra_file"
         all_page_urls+=("${extra_urls[@]}")
     fi
@@ -312,9 +315,9 @@ main() {
         (( nested_failed > 0 )) && exit 3
         exit 1
     fi
-    mapfile -t unique_urls < <(printf "%s\n" "${all_page_urls[@]}" | grep . | sort -u)
+    { printf "%s\n" "${all_page_urls[@]}" | grep . | sort -u || true; } | mapfile -t unique_urls
     local total_unique_count=${#unique_urls[@]}
-    mapfile -t final_urls < <(printf "%s\n" "${unique_urls[@]}" | grep -vFf "$EXCLUSION_FILE")
+    { printf "%s\n" "${unique_urls[@]}" | grep -vFf "$EXCLUSION_FILE" || true; } | mapfile -t final_urls
     if [[ ${#final_urls[@]} -eq 0 ]]; then
         log "$SAFE_ID" "No valid URLs left after filtering. Exiting."
         exit 1
@@ -326,7 +329,7 @@ main() {
     local total_warmed_count="${#final_urls[@]}"
     for (( i=0; i<total_warmed_count; i++ )); do
         page_url="${final_urls[i]}"
-        read -r d_time m_time < <(warm_url "$page_url" "$((i+1))" "$total_warmed_count" resolve_args "$SAFE_ID" "$VERBOSE_FLAG") || { d_time=0; m_time=0; }
+        warm_url "$page_url" "$((i+1))" "$total_warmed_count" resolve_args "$SAFE_ID" "$VERBOSE_FLAG" | read -r d_time m_time || { d_time=0; m_time=0; }
         if [[ "$d_time" == "redirect" ]]; then
             redirect_count=$((redirect_count + 1))
             continue
