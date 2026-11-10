@@ -1,5 +1,11 @@
 #!/bin/bash
-# Cache Warmer Script - PORTABLE v5.8.4 (portable XML parser, errexit-safe)
+# Cache Warmer Script - PORTABLE v5.9.0 (portable XML parser, errexit-safe)
+# v5.9.0: no bc dependency (pause and stats math in awk, present everywhere), so
+# the script runs on managed hosts without bc. The grep parser now reads
+# <loc><![CDATA[...]]></loc> entries (some SEO plugins emit them).
+# CACHE_WARMER_SINGLE_UA=1 (exactly "1") fetches each URL once (desktop UA only)
+# for hosts whose page cache shares one entry between mobile and desktop; the
+# mobile stats columns are then left empty.
 # v5.8.0: page URLs are fetched WITHOUT following redirects. A sitemap URL that
 # answers 3xx is skipped (no mobile fetch, no back-off) instead of warming its
 # target again: on one WordPress site 212 of 471 sitemap URLs were 301s onto a
@@ -47,7 +53,7 @@ PARSE_MODE=""
 # -----------------
 
 check_dependencies() {
-    local -a required_cmds=("curl" "bc" "flock")
+    local -a required_cmds=("curl" "awk" "flock")
     local -a missing_cmds=()
 
     for cmd in "${required_cmds[@]}"; do
@@ -82,7 +88,8 @@ log() {
 # (&amp; last, so entity-encoded entities survive one round), so the two
 # hosts warm identical URLs. The modes are equivalent for standard sitemaps
 # (plain <loc> elements, as emitted by WordPress/Yoast) but differ on exotic
-# content: the grep branch does not match CDATA, multiline, or
+# content: the grep branch reads <loc><![CDATA[...]]></loc> (no whitespace
+# between <loc> and the CDATA) but not multiline or
 # namespace-prefixed <loc>, and matches <loc> inside XML comments; xmlstarlet
 # behaves oppositely on those. The || true in both branches keeps a no-match
 # grep (exit 1) or a failing xmlstarlet from aborting the caller under
@@ -94,8 +101,8 @@ parse_locs() {
                   -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
     else
-        { grep -o '<loc>[^<]*</loc>' || true; } \
-            | sed -e 's|^<loc>||' -e 's|</loc>$||' \
+        { grep -oE '<loc>(<!\[CDATA\[)?[^<]*(]]>)?</loc>' || true; } \
+            | sed -e 's|^<loc>||' -e 's|</loc>$||' -e 's|^<!\[CDATA\[||' -e 's|]]>$||' \
                   -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
                   -e 's/&#038;/\&/g' -e 's/&#38;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' \
                   -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g'
@@ -104,6 +111,11 @@ parse_locs() {
 
 is_numeric() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+# Back-off after a fetch: t*t*1.2 + 0.1 seconds, 0 for a failed fetch (t=0).
+pause_for() {
+    LC_ALL=C awk -v t="$1" 'BEGIN { if (t+0 > 0) printf "%.4f", t*t*1.2 + 0.1; else print 0 }'
 }
 
 warm_url() {
@@ -141,18 +153,22 @@ warm_url() {
         desktop_time="0"
     fi
 
-    # Mobile
+    # Mobile (skipped when one cache entry serves both device types)
     curl_ret=0
-    mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -s --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
-    if [[ $curl_ret -eq 28 ]]; then
-        log "$safe_id" "WARNING: Timeout warming $url_to_warm (Mobile Agent)"
+    if [[ "${CACHE_WARMER_SINGLE_UA:-0}" == "1" ]]; then
         mobile_time="0"
-    elif [[ $curl_ret -ne 0 ]]; then
-        mobile_time="0"
+    else
+        mobile_time=$(nice -n 19 curl --max-time 30 "${resolve_args_ref[@]}" -A "$USER_AGENT_MOBILE" -s --compressed -o /dev/null -w "%{time_total}" -- "$url_to_warm" 2>/dev/null) || curl_ret=$?
+        if [[ $curl_ret -eq 28 ]]; then
+            log "$safe_id" "WARNING: Timeout warming $url_to_warm (Mobile Agent)"
+            mobile_time="0"
+        elif [[ $curl_ret -ne 0 ]]; then
+            mobile_time="0"
+        fi
     fi
 
-    local desktop_sleep=0; if is_numeric "$desktop_time"; then desktop_sleep=$(bc <<< "scale=4; if($desktop_time > 0) $desktop_time * $desktop_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
-    local mobile_sleep=0; if is_numeric "$mobile_time"; then mobile_sleep=$(bc <<< "scale=4; if($mobile_time > 0) $mobile_time * $mobile_time * 1.2 + 0.1 else 0" 2>/dev/null); fi
+    local desktop_sleep=0; if is_numeric "$desktop_time"; then desktop_sleep=$(pause_for "$desktop_time"); fi
+    local mobile_sleep=0; if is_numeric "$mobile_time"; then mobile_sleep=$(pause_for "$mobile_time"); fi
     if [[ "$verbose_flag" == "verbose" ]]; then
         local progress_str="($progress_counter/$total_urls)"
         local pause_str="Pausing D: ${desktop_sleep:-0}s, M: ${mobile_sleep:-0}s"
@@ -169,12 +185,8 @@ calculate_stats() {
     local min max
     min=$(printf "%s\n" "${times_array[@]}" | sort -n | head -n1)
     max=$(printf "%s\n" "${times_array[@]}" | sort -n | tail -n1)
-    local total=0
-    for t in "${times_array[@]}"; do
-        if is_numeric "$t"; then total=$(bc <<< "$total + $t"); fi
-    done
     local avg
-    avg=$(bc <<< "scale=4; $total / ${#times_array[@]}")
+    avg=$(printf "%s\n" "${times_array[@]}" | LC_ALL=C awk -v n="${#times_array[@]}" '/^[0-9]+([.][0-9]+)?$/ { s += $1 } END { printf "%.4f", s / n }')
     echo "$min,$max,$avg"
 }
 
@@ -325,7 +337,11 @@ main() {
     local desktop_stats
     desktop_stats=$(calculate_stats "${desktop_times[@]}")
     local mobile_stats
-    mobile_stats=$(calculate_stats "${mobile_times[@]}")
+    if [[ "${CACHE_WARMER_SINGLE_UA:-0}" == "1" ]]; then
+        mobile_stats=",,"   # not fetched: empty, not 0 (0 reads as failed fetches)
+    else
+        mobile_stats=$(calculate_stats "${mobile_times[@]}")
+    fi
     local timestamp
     timestamp=$(date --iso-8601=seconds)
     if [ ! -f "$STATS_FILE" ]; then
